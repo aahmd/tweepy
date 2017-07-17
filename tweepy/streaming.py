@@ -8,8 +8,8 @@ from __future__ import absolute_import, print_function
 
 import logging
 import re
+import bz2
 import requests
-import sys
 from requests.exceptions import Timeout
 from threading import Thread
 from time import sleep
@@ -150,19 +150,26 @@ class ReadBuffer(object):
     use small chunks so it can read the length and the tweet in 2 read calls.
     """
 
-    def __init__(self, stream, chunk_size, encoding='utf-8'):
+    def __init__(self, stream, chunk_size, encoding='utf-8', bzipped=False):
         self._stream = stream
         self._buffer = six.b('')
         self._chunk_size = chunk_size
         self._encoding = encoding
+        self.bzipped = bzipped
+        if (bzipped):
+            self.decompress = bz2.decompress(self)
 
     def read_len(self, length):
         while not self._stream.closed:
             if len(self._buffer) >= length:
                 return self._pop(length)
-            read_len = max(self._chunk_size, length - len(self._buffer))
-            self._buffer += self._stream.read(read_len)
-        return six.b('')
+            if self.bzipped:
+                chunk = self._stream.read(self._chunk_size)
+                string_chunk = self.decompress.decompress(chunk)
+                self._buffer += string_chunk
+            else:
+                read_len = max(self._chunk_size, length - len(self._buffer))
+                self._buffer += self._stream.read(read_len)
 
     def read_line(self, sep=six.b('\n')):
         """Read the data stream until a given separator is found (default \n)
@@ -178,8 +185,12 @@ class ReadBuffer(object):
                 return self._pop(loc + len(sep))
             else:
                 start = len(self._buffer)
-            self._buffer += self._stream.read(self._chunk_size)
-        return six.b('')
+            if self.bzipped:
+                chunk = self._stream.read(self._chunk_size)
+                string_chunk = self.decompress.decompress(chunk)
+                self._buffer += string_chunk
+            else:
+                self._buffer += self._stream.read(self._chunk_size)
 
     def _pop(self, length):
         r = self._buffer[:length]
@@ -233,7 +244,7 @@ class Stream(object):
         # Connect and process the stream
         error_counter = 0
         resp = None
-        exc_info = None
+        exception = None
         while self.running:
             if self.retry_count is not None:
                 if error_counter > self.retry_count:
@@ -270,7 +281,7 @@ class Stream(object):
                 # If it's not time out treat it like any other exception
                 if isinstance(exc, ssl.SSLError):
                     if not (exc.args and 'timed out' in str(exc.args[0])):
-                        exc_info = sys.exc_info()
+                        exception = exc
                         break
                 if self.listener.on_timeout() is False:
                     break
@@ -280,7 +291,7 @@ class Stream(object):
                 self.snooze_time = min(self.snooze_time + self.snooze_time_step,
                                        self.snooze_time_cap)
             except Exception as exc:
-                exc_info = sys.exc_info()
+                exception = exc
                 # any other exception is fatal, so kill loop
                 break
 
@@ -291,16 +302,17 @@ class Stream(object):
 
         self.new_session()
 
-        if exc_info:
+        if exception:
             # call a handler first so that the exception can be logged.
-            self.listener.on_exception(exc_info[1])
-            six.reraise(*exc_info)
+            self.listener.on_exception(exception)
+            raise exception
 
     def _data(self, data):
         if self.listener.on_data(data) is False:
             self.running = False
 
     def _read_loop(self, resp):
+        bzipped = resp.headers.get('content-Encoding', '') == 'bzip'
         charset = resp.headers.get('content-type', default='')
         enc_search = re.search('charset=(?P<enc>\S*)', charset)
         if enc_search is not None:
@@ -308,22 +320,24 @@ class Stream(object):
         else:
             encoding = 'utf-8'
 
-        buf = ReadBuffer(resp.raw, self.chunk_size, encoding=encoding)
+        buf = ReadBuffer(resp.raw, self.chunk_size, encoding=encoding, bzipped=bzipped)
 
         while self.running and not resp.raw.closed:
             length = 0
-            while not resp.raw.closed:
+            while not resp.raw.closed and not None:
                 line = buf.read_line().strip()
                 if not line:
                     self.listener.keep_alive()  # keep-alive new lines are expected
-                elif line.strip().isdigit():
+                elif line.isdigit():
                     length = int(line)
                     break
                 else:
                     raise TweepError('Expecting length, unexpected value found')
+            else:
+                pass
 
             next_status_obj = buf.read_len(length)
-            if self.running and next_status_obj:
+            if self.running:
                 self._data(next_status_obj)
 
             # # Note: keep-alive newlines might be inserted before each length value.
@@ -412,15 +426,13 @@ class Stream(object):
         self.url = '/%s/statuses/retweet.json' % STREAM_VERSION
         self._start(async)
 
-    def sample(self, async=False, languages=None, stall_warnings=False):
+    def sample(self, async=False, languages=None):
         self.session.params = {'delimited': 'length'}
         if self.running:
             raise TweepError('Stream object already connected!')
         self.url = '/%s/statuses/sample.json' % STREAM_VERSION
         if languages:
             self.session.params['language'] = ','.join(map(str, languages))
-        if stall_warnings:
-            self.session.params['stall_warnings'] = 'true'
         self._start(async)
 
     def filter(self, follow=None, track=None, async=False, locations=None,
@@ -444,7 +456,7 @@ class Stream(object):
         if languages:
             self.body['language'] = u','.join(map(str, languages))
         if filter_level:
-            self.body['filter_level'] = filter_level.encode(encoding)
+            self.body['filter_level'] = unicode(filter_level, encoding)
         self.session.params = {'delimited': 'length'}
         self.host = 'stream.twitter.com'
         self._start(async)
